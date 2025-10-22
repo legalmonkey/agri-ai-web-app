@@ -9,3 +9,5 @@ keras==2.10.0
 python-multipart==0.0.9
 scikit-learn==1.6.1
 scikit-learn-intelex  
+xgboost==2.1.4
+scipy>=1.13.1
