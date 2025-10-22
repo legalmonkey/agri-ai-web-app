@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local datasets (NOT the processed CSVs)
+datasets/
+
+# Logs
+*.log
+
+# Don't ignore processed training CSVs - they're needed for the app!
+!processed_training_csvs/**/*.csv
