@@ -19,7 +19,7 @@ app = FastAPI()
 
 # ------------------------------ Project paths ------------------------------
 PROJ_ROOT = os.getcwd()
-MODEL_PATH = os.path.join(PROJ_ROOT, "artifacts_yield", "yield_pipeline.pkl")
+MODEL_PATH = os.path.join(PROJ_ROOT, "artifacts_yield", "yield_pipeline_forward_chain_PRODUCTION.pkl")
 CROP_DURATIONS_PATH = os.path.join(PROJ_ROOT, "crop_durations.json")
 RULES_PATH = os.path.join(PROJ_ROOT, "rules", "crop_reco.json")
 PROC_DIR = os.path.join(PROJ_ROOT, "processed_training_csvs")
@@ -32,8 +32,7 @@ OPTIMAL_TEMP_RANGE = (20.0, 30.0)
 # ------------------------------ Globals ------------------------------
 _ready = {"ok": False, "reason": "initializing"}
 _preprocessor = None
-_models_xgb = None
-_meta_models = None
+_models_forward_chain = None
 _targets = []
 _CROP_DURATIONS: Dict = {}
 _RULES_CACHE: Dict = {}
@@ -318,14 +317,22 @@ def assess_weather_risks(week, progress):
 
 # ------------------------------ Model load ------------------------------
 def _safe_load_model():
-    global _preprocessor, _models_xgb, _meta_models, _targets, _ready, _CROP_DURATIONS
+    global _preprocessor, _models_forward_chain, _targets, _ready, _CROP_DURATIONS
     try:
-        # Load ML pipeline
+        # Load forward chain production model
+        print(f"[MODEL] Loading from: {MODEL_PATH}")
+        print(f"[MODEL] File exists: {os.path.exists(MODEL_PATH)}")
+        if os.path.exists(MODEL_PATH):
+            print(f"[MODEL] File size: {os.path.getsize(MODEL_PATH) / (1024**2):.2f} MB")
+        
         artifacts = joblib.load(MODEL_PATH)
         _preprocessor = artifacts['preprocessor']
-        _models_xgb = artifacts['models_xgb']
-        _meta_models = artifacts['meta_models']
+        _models_forward_chain = artifacts['models_forward_chain']
         _targets = artifacts['targets']
+        
+        # Debug: Check expected feature count
+        if hasattr(_preprocessor, 'n_features_in_'):
+            print(f"[MODEL] Preprocessor expects {_preprocessor.n_features_in_} features")
         
         # Load crop durations
         if os.path.isfile(CROP_DURATIONS_PATH):
@@ -336,9 +343,13 @@ def _safe_load_model():
         
         _ready["ok"] = True
         _ready["reason"] = "ready"
+        print(f"[MODEL] ✓ Successfully loaded model with {len(_targets)} targets: {_targets}")
     except Exception as e:
         _ready["ok"] = False
         _ready["reason"] = f"startup failed: {e}"
+        print(f"[MODEL] ✗ Failed to load: {e}")
+        import traceback
+        traceback.print_exc()
 
 _safe_load_model()
 
@@ -372,7 +383,7 @@ def _predict_core(state: str, district: str, crop: str, land_area: float, sowing
     for base_col in ["yieldcalc", "production", "area"]:
         deltas[f"{base_col}_delta1"] = 0.0
     
-    # Build input
+    # Build input - ONLY columns that match training (NO DUPLICATES)
     input_data = pd.DataFrame([{
         'statename': state,
         'districtname': district,
@@ -384,46 +395,56 @@ def _predict_core(state: str, district: str, crop: str, land_area: float, sowing
         'area': float(land_area),
         'lat': lat,
         'lon': lon,
+        # Weather features - NO _x, _y suffixes
         'Rainfall_sum': week['Rainfall_sum'],
         'Tavg_mean': week['Tavg_mean'],
         'Tmax_mean': week['Tmax_mean'],
         'Tmin_mean': week['Tmin_mean'],
         'ET0_sum': week['ET0_sum'],
         'GDD_sum': week['GDD_sum'],
-        'Rainfall_sum_x': week['Rainfall_sum'],
-        'Tavg_mean_x': week['Tavg_mean'],
-        'Tmax_mean_x': week['Tmax_mean'],
-        'Tmin_mean_x': week['Tmin_mean'],
-        'ET0_sum_x': week['ET0_sum'],
-        'GDD_sum_x': week['GDD_sum'],
-        'Rainfall_sum_y': week['Rainfall_sum'],
-        'Tavg_mean_y': week['Tavg_mean'],
-        'Tmax_mean_y': week['Tmax_mean'],
-        'Tmin_mean_y': week['Tmin_mean'],
-        'ET0_sum_y': week['ET0_sum'],
-        'GDD_sum_y': week['GDD_sum'],
+        # Lags
         **lags,
+        # Deltas
         **deltas,
     }])
     
+    # Debug logging
+    print(f"[PREDICT] Input DataFrame shape: {input_data.shape}")
+    print(f"[PREDICT] Input columns ({len(input_data.columns)}): {list(input_data.columns)}")
+    
     # Preprocess
-    X_proc = _preprocessor.transform(input_data)
+    try:
+        X_proc = _preprocessor.transform(input_data)
+        print(f"[PREDICT] Preprocessed shape: {X_proc.shape}")
+    except Exception as e:
+        print(f"[PREDICT] Preprocessing failed: {e}")
+        raise
     
-    # Get predictions
-    yield_idx = _targets.index('yieldcalc')
+    # Get predictions from forward chain fold models
+    predictions = {}
+    for target in _targets:
+        if target not in _models_forward_chain:
+            predictions[target] = 0.0
+            continue
+        
+        fold_data = _models_forward_chain[target]
+        
+        if isinstance(fold_data, dict) and 'fold_models' in fold_data:
+            fold_models = fold_data['fold_models']
+            fold_preds = np.array([model.predict(X_proc)[0] for model in fold_models])
+            predictions[target] = float(np.mean(fold_preds))
+        else:
+            predictions[target] = 0.0
     
-    all_target_preds = []
-    for t_idx in range(len(_targets)):
-        fold_preds = np.array([m.predict(X_proc) for m in _models_xgb[t_idx]])
-        target_avg = np.mean(fold_preds, axis=0)
-        all_target_preds.append(target_avg[0])
-    
-    stack_input = np.array(all_target_preds).reshape(1, -1)
-    yield_pred = _meta_models[yield_idx].predict(stack_input)[0]
+    # Extract predictions
+    yield_pred = predictions.get('yieldcalc', 0.0)
+    prod_pred = predictions.get('production', 0.0)
+    area_pred = predictions.get('area', land_area)
     
     # Clip to realistic bounds
     yield_pred = max(0.1, min(yield_pred, 20.0))
-    prod_pred = yield_pred * land_area
+    prod_pred = max(0.0, prod_pred)
+    area_pred = max(0.0, area_pred)
     
     # Risk assessment
     risk_assessment = assess_weather_risks(week, season_info['progress'])
@@ -442,6 +463,7 @@ def _predict_core(state: str, district: str, crop: str, land_area: float, sowing
         "crop_duration_days": season_info['days_total'],
         "yield_per_hectare": yield_pred,
         "area_input": land_area,
+        "area_predicted": area_pred,
         "production_pred": prod_pred,
         "forecast_date": ref_date.strftime("%Y-%m-%d"),
         "season_progress_pct": round(season_info['progress'] * 100, 1),
@@ -453,7 +475,7 @@ def _predict_core(state: str, district: str, crop: str, land_area: float, sowing
         "risk": risk_assessment,
     }
 
-# ------------------------------ UI Routes ------------------------------
+# ------------------------------ UI Routes (SAME AS BEFORE) ------------------------------
 @app.get("/", response_class=HTMLResponse)
 def form():
     return """
@@ -525,6 +547,10 @@ def form():
     }
     select.input option{
       color:#0b130f; background:#ffffff;
+    }
+    
+    @media (max-width: 768px) {
+      .row{ grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -639,7 +665,7 @@ def form():
 def health():
     return "ok"
 
-# ------------------------------ Results page ------------------------------
+# ------------------------------ Results page (SAME HTML AS BEFORE) ------------------------------
 @app.post("/predict", response_class=HTMLResponse)
 def predict(
     state: str = Form(...),
@@ -659,7 +685,6 @@ def predict(
             try: return f"{float(x):,.3f}"
             except: return str(x)
 
-        # Recommendations
         reco = recommend_for_crop(out["crop"])
         irr_title = reco["irrigation"]["title"]
         irr_sub   = reco["irrigation"]["subtitle"]
@@ -668,7 +693,6 @@ def predict(
         pest_active_list = reco.get("pesticides", [])
         pest_grid_items = "".join([f'<div class="pill">{a}</div>' for a in (pest_active_list if pest_active_list else ["No actives"])])
 
-        # Risk level color
         risk_level = out['risk']['risk_level']
         if risk_level == 'LOW':
             risk_color = '#30d158'
@@ -678,7 +702,7 @@ def predict(
             risk_color = '#ff9f0a'
             risk_bg = 'rgba(255, 159, 10, 0.12)'
             risk_border = 'rgba(255, 159, 10, 0.25)'
-        else:  # HIGH
+        else:
             risk_color = '#ff453a'
             risk_bg = 'rgba(255, 69, 58, 0.12)'
             risk_border = 'rgba(255, 69, 58, 0.25)'
@@ -737,6 +761,7 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
           box-shadow:0 8px 18px rgba(48,209,88,0.25), inset 0 1px 0 rgba(255,255,255,0.35); }}
 .adv-card{{ margin-top:14px; display:none; }}
 .adv-grid{{ display:grid; grid-template-columns: 1fr 1fr; gap:18px; }}
+
 @media (max-width: 900px){{ .grid-2{{ grid-template-columns:1fr; }} .adv-grid{{ grid-template-columns:1fr; }} }}
 </style>
 </head>
@@ -757,17 +782,21 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
           <div class="kv"><span class="k">District</span><span class="v">{out["district"]}</span></div>
           <div class="kv"><span class="k">Crop</span><span class="v">{out["crop"]}</span></div>
           <div class="kv"><span class="k">Season</span><span class="v">{out["season"]}</span></div>
-          <div class="kv"><span class="k">Area (hectares)</span><span class="v">{_f2(out["area_input"])}</span></div>
+          <div class="kv"><span class="k">Land Area (input)</span><span class="v">{_f2(out["area_input"])} ha</span></div>
         </div>
 
         <div class="card">
-          <h3>Predicted {out["crop"]} yield</h3>
-          <div class="yield-big">{_f2(out["yield_per_hectare"])} tonnes/ha</div>
-          <div class="yield-sub">Estimated total: {_f2(out["production_pred"])} tonnes</div>
+          <h3>AI Predictions</h3>
+          <div class="kv"><span class="k">Predicted Yield</span><span class="v">{_f2(out["yield_per_hectare"])} t/ha</span></div>
+          <div class="kv"><span class="k">Predicted Production</span><span class="v">{_f2(out["production_pred"])} tonnes</span></div>
+          <div class="kv"><span class="k">Predicted Area</span><span class="v">{_f2(out["area_predicted"])} ha</span></div>
+          <div style="margin-top:14px;padding:14px;background:rgba(48,209,88,0.12);border-radius:12px;border:1px solid rgba(48,209,88,0.2);">
+            <div style="font-size:14px;color:#9cc0b1;margin-bottom:4px;">Total Estimated Output</div>
+            <div style="font-size:32px;font-weight:800;color:#c4ffd2;">{_f2(out["production_pred"])} tonnes</div>
+          </div>
         </div>
       </div>
 
-      <!-- Growth Stage Card -->
       <div class="card progress-card">
         <h3>Growth Stage (as of {out["forecast_date"]})</h3>
         <div class="grid-2" style="margin-top:12px;">
@@ -788,7 +817,6 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
         </div>
       </div>
 
-      <!-- Risk Assessment -->
       <div class="card" style="margin-top:18px;">
         <h3>Risk Assessment</h3>
         <div class="risk-badge" style="background:{risk_bg}; border:1px solid {risk_border}; color:{risk_color};">
@@ -799,7 +827,6 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
         </div>
       </div>
 
-      <!-- Recommendation Cards -->
       <div class="grid-2" style="margin-top:18px;">
         <div class="card" style="background:linear-gradient(180deg, rgba(7,20,15,.6), rgba(7,20,15,.45)); border-color:rgba(48,209,88,0.18);">
           <div style="display:flex;align-items:center;gap:12px;">
@@ -820,7 +847,6 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
         </div>
       </div>
 
-      <!-- Pesticides -->
       <div class="card" style="margin-top:18px;background:linear-gradient(180deg, rgba(18,7,32,.55), rgba(18,7,32,.45)); border-color:rgba(155,125,200,0.18);">
         <div style="display:flex;align-items:center;gap:12px;">
           <div style="width:44px;height:44px;border-radius:12px;background:rgba(155,125,200,.12);display:flex;align-items:center;justify-content:center;border:1px solid rgba(155,125,200,.3);">🛡️</div>
@@ -829,7 +855,6 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
         <div class="pest-grid">{pest_grid_items}</div>
       </div>
 
-      <!-- Advanced insights -->
       <div class="adv-wrap">
         <button class="adv-btn" id="advToggle" aria-expanded="false">Show advanced insights</button>
         <div class="card adv-card" id="advCard" aria-hidden="true" style="display:none;">
@@ -839,15 +864,16 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
               <div class="kv"><span class="k">Latitude</span><span class="v">{_f3(out["lat"])}</span></div>
               <div class="kv"><span class="k">Longitude</span><span class="v">{_f3(out["lon"])}</span></div>
               <div class="kv"><span class="k">Forecast Date</span><span class="v">{out["forecast_date"]}</span></div>
+              <div class="kv"><span class="k">Crop Year</span><span class="v">{out["sowing_date"][:4]}</span></div>
             </div>
             <div class="card">
               <h3>Weather (Past 7 Days)</h3>
-              <div class="kv"><span class="k">Rainfall_sum</span><span class="v">{_f2(out["weather"]["Rainfall_sum"])}</span></div>
-              <div class="kv"><span class="k">Tavg_mean</span><span class="v">{_f2(out["weather"]["Tavg_mean"])}</span></div>
-              <div class="kv"><span class="k">Tmax_mean</span><span class="v">{_f2(out["weather"]["Tmax_mean"])}</span></div>
-              <div class="kv"><span class="k">Tmin_mean</span><span class="v">{_f2(out["weather"]["Tmin_mean"])}</span></div>
-              <div class="kv"><span class="k">ET0_sum</span><span class="v">{_f2(out["weather"]["ET0_sum"])}</span></div>
-              <div class="kv"><span class="k">GDD_sum</span><span class="v">{_f2(out["weather"]["GDD_sum"])}</span></div>
+              <div class="kv"><span class="k">Rainfall_sum</span><span class="v">{_f2(out["weather"]["Rainfall_sum"])} mm</span></div>
+              <div class="kv"><span class="k">Tavg_mean</span><span class="v">{_f2(out["weather"]["Tavg_mean"])} °C</span></div>
+              <div class="kv"><span class="k">Tmax_mean</span><span class="v">{_f2(out["weather"]["Tmax_mean"])} °C</span></div>
+              <div class="kv"><span class="k">Tmin_mean</span><span class="v">{_f2(out["weather"]["Tmin_mean"])} °C</span></div>
+              <div class="kv"><span class="k">ET0_sum</span><span class="v">{_f2(out["weather"]["ET0_sum"])} mm</span></div>
+              <div class="kv"><span class="k">GDD_sum</span><span class="v">{_f2(out["weather"]["GDD_sum"])} °C-days</span></div>
             </div>
           </div>
         </div>
@@ -875,7 +901,10 @@ html,body{{ height:100%; margin:0; font-family:"Inter",system-ui,-apple-system,S
 """
         return HTMLResponse(html)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[ERROR] Prediction failed: {error_detail}")
+        return JSONResponse({"error": str(e), "detail": error_detail}, status_code=400)
 
 @app.post("/predict/", response_class=HTMLResponse)
 def predict_trailing(
