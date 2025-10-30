@@ -717,6 +717,40 @@ def form():
       </form>
     </section>
   </div>
+
+  <script>
+    // Prefill form inputs from URL query parameters
+    window.onload = function() {{
+      try {{
+        const params = new URLSearchParams(window.location.search);
+        const setIfPresent = (id, key) => {{
+          const el = document.getElementById(id);
+          if (!el) return;
+          const v = params.get(key);
+          if (v !== null && v !== undefined) {{
+            el.value = v;
+          }}
+        }};
+
+        // Map query keys -> your actual element IDs
+        setIfPresent('state', 'state');              // ?state=...
+        setIfPresent('district', 'district');        // ?district=...
+        setIfPresent('crop', 'crop');                // ?crop=...  matches <select id="crop">
+        setIfPresent('land', 'land_area');           // ?land_area=... maps to <input id="land" name="land_area">
+        setIfPresent('sowingDate', 'sowing_date');   // ?sowing_date=... maps to <input id="sowingDate" name="sowing_date">
+        setIfPresent('endDate', 'end_date');         // ?end_date=...
+
+        // If you must keep the original mapping you posted (farm_size_acres, crop_type, sowing_date),
+        // you can support both by adding these extra lines:
+        setIfPresent('land', 'farm_size_acres');     // also accept ?farm_size_acres=...
+        setIfPresent('crop', 'crop_type');           // also accept ?crop_type=...
+        setIfPresent('sowingDate', 'sowing_date');   // same as above; already mapped
+      }} catch (e) {{
+        console.warn('[WARN] Prefill script error:', e);
+      }}
+    }};
+  </script>
+
 </body>
 </html>
     """
