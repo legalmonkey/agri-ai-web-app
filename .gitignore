@@ -1,0 +1,48 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+agri/
+*/Lib/
+*/Library/
+*/Scripts/
+*/Include/
+
+# Conda
+.conda/
+.condarc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model artifacts (optional — only if very large)
+artifacts_yield/*.pkl
+artifacts_yield/*.joblib
+
+# Large binaries
+*.exe
+*.bin
+*.dat
